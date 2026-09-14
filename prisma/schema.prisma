@@ -1,0 +1,231 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "postgresql"
+}
+model User {
+  id String @id @default(uuid())
+  email String @unique
+  passwordHash String
+  name String
+  bio String @default("")
+  domain String @default("")
+  verificationStatus String @default("UNVERIFIED")
+  createdAt DateTime @default(now())
+}
+model Session {
+  id String @id
+  userId String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  @@index([userId])
+}
+model Capsule {
+  id String @id @default(uuid())
+  ownerId String
+  title String
+  slug String @unique
+  domain String
+  scope String
+  visibility String @default("PRIVATE")
+  status String @default("DRAFT")
+  currentVersion String?
+  revision Int @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([ownerId])
+  @@index([visibility,status])
+}
+model SourceAsset {
+  id String @id @default(uuid())
+  capsuleId String
+  contributorId String
+  contributor String
+  title String
+  type String
+  objectKey String @unique
+  sha256 String
+  contentType String
+  size Int
+  text String @default("")
+  status String @default("PENDING")
+  createdAt DateTime @default(now())
+  @@index([capsuleId])
+}
+model KnowledgeItem {
+  id String @id @default(uuid())
+  capsuleId String
+  sourceId String
+  contributorId String
+  contributor String
+  kind String
+  text String
+  proposal String
+  confidence Float
+  status String @default("PENDING")
+  critical Boolean @default(false)
+  citation Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([capsuleId,status])
+}
+model CapsuleVersion {
+  id String @id @default(uuid())
+  capsuleId String
+  version String
+  manifestHash String @unique
+  manifest Json
+  knowledge Json
+  evaluation Json
+  publishedAt DateTime @default(now())
+  @@unique([capsuleId,version])
+}
+model Evaluation {
+  id String @id @default(uuid())
+  capsuleId String
+  revision Int
+  passed Boolean
+  metrics Json
+  cases Json
+  suiteHash String
+  createdAt DateTime @default(now())
+  @@index([capsuleId,createdAt])
+}
+model EvaluationCase {
+  id String @id @default(uuid())
+  capsuleId String
+  question String
+  expectedElements String[]
+  forbiddenElements String[]
+  unsupported Boolean @default(false)
+  approvedBy String
+  createdAt DateTime @default(now())
+  @@index([capsuleId])
+}
+model LicenseTemplate {
+  id String @id @default(uuid())
+  capsuleId String
+  name String
+  audience String
+  purposes String[]
+  aiTrainingAllowed Boolean @default(false)
+  commercialUse Boolean @default(false)
+  derivativeUse Boolean @default(false)
+  usageLimit Int
+  durationDays Int
+  createdAt DateTime @default(now())
+  @@index([capsuleId])
+}
+model LicenseGrant {
+  id String @id @default(uuid())
+  templateId String
+  capsuleId String
+  ownerId String
+  name String
+  grantee String
+  audience String
+  purposes String[]
+  aiTrainingAllowed Boolean @default(false)
+  commercialUse Boolean @default(false)
+  derivativeUse Boolean @default(false)
+  usageLimit Int
+  used Int @default(0)
+  startsAt DateTime @default(now())
+  expiresAt DateTime
+  status String @default("ACTIVE")
+  createdAt DateTime @default(now())
+  @@index([capsuleId,grantee,status])
+  @@index([ownerId])
+}
+model Conversation {
+  id String @id @default(uuid())
+  capsuleId String
+  userId String
+  version String
+  purpose String
+  createdAt DateTime @default(now())
+}
+model Message {
+  id String @id @default(uuid())
+  conversationId String
+  userId String
+  requestKey String @unique
+  question String
+  answer Json
+  createdAt DateTime @default(now())
+}
+model UsageEvent {
+  id String @id @default(uuid())
+  capsuleId String
+  capsuleVersionId String
+  licenseId String
+  actorId String
+  purpose String
+  units Int @default(1)
+  requestKey String @unique
+  occurredAt DateTime @default(now())
+  @@index([capsuleId,occurredAt])
+}
+model AuditEvent {
+  id String @id @default(uuid())
+  actorId String
+  capsuleId String?
+  action String
+  entityId String?
+  metadata Json
+  createdAt DateTime @default(now())
+  @@index([capsuleId,createdAt])
+}
+model Interview {
+  id String @id @default(uuid())
+  capsuleId String
+  ownerId String
+  status String @default("RECORDING")
+  coverage Json
+  createdAt DateTime @default(now())
+}
+model InterviewSegment {
+  id String @id @default(uuid())
+  interviewId String
+  sequence Int
+  objectKey String
+  sha256 String
+  text String @default("")
+  @@unique([interviewId,sequence])
+}
+model UploadTicket {
+  id String @id @default(uuid())
+  ownerId String
+  capsuleId String
+  interviewId String?
+  sequence Int?
+  objectKey String @unique
+  contentType String
+  size Int
+  sha256 String
+  idempotencyKey String @unique
+  expiresAt DateTime
+}
+model JobRecord {
+  id String @id
+  capsuleId String
+  kind String
+  payload Json
+  status String @default("PENDING")
+  attempts Int @default(0)
+  lastError String?
+  result Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([status,kind])
+}
+model AccessRequest {
+  id String @id @default(uuid())
+  capsuleId String
+  templateId String
+  userId String
+  status String @default("PENDING")
+  createdAt DateTime @default(now())
+  @@unique([templateId,userId])
+}

@@ -1,0 +1,35 @@
+import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
+const base='http://127.0.0.1:4000/v1';
+let cookie='';
+async function call(path,body,expected=200){const response=await fetch(base+path,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json',Origin:'http://localhost:3100',Cookie:cookie},body:body===undefined?undefined:JSON.stringify(body)});const setCookie=response.headers.get('set-cookie');if(setCookie)cookie=setCookie.split(';')[0];const result=await response.json();assert.ok(response.status===expected||(expected===200&&response.status===201),`${path}: ${response.status} ${JSON.stringify(result)}`);return result;}
+const id=randomUUID();
+const email=`smoke-${id}@example.test`;
+await call('/auth/register',{email,name:'Synthetic Smoke Expert',password:`test-only-${randomUUID()}`});
+console.log('PASS registration and session');
+let workspace=await call('/workspace/actions',{type:'create-capsule',data:{title:`Synthetic smoke ${id.slice(0,8)}`,domain:'Equipment maintenance',scope:'Checking changes before replacing equipment components. Synthetic integration fixture.',visibility:'PRIVATE'}});
+const capsule=workspace.capsules[0];
+workspace=await call('/workspace/actions',{type:'add-source',capsuleId:capsule.id,data:{title:'Synthetic maintenance note',type:'NOTE',text:'Check operating changes before replacing equipment components.'}});
+for(let i=0;i<60;i++){workspace=await call('/workspace');if(workspace.knowledge.length)break;await new Promise(resolve=>setTimeout(resolve,1000));}
+assert.ok(workspace.knowledge.length,'Source processing did not produce candidate knowledge');
+for(const item of workspace.knowledge)await call('/workspace/actions',{type:'approve',capsuleId:capsule.id,id:item.id});
+console.log('PASS private source ingestion and expert approval');
+await call(`/capsules/${capsule.id}/evaluations/cases`,{question:'What should I check before replacing equipment?',expectedElements:['Check operating changes'],unsupported:false});
+await call(`/capsules/${capsule.id}/evaluations/cases`,{question:'What is the best chocolate cake recipe?',expectedElements:[],unsupported:true});
+workspace=await call('/workspace/actions',{type:'evaluate',capsuleId:capsule.id});
+assert.equal(workspace.evaluations[0].passed,true);
+workspace=await call('/workspace/actions',{type:'publish',capsuleId:capsule.id});
+assert.equal(workspace.capsules[0].version,'1.0.0');
+console.log('PASS expert golden evaluation and immutable publication');
+workspace=await call('/workspace/actions',{type:'grant',capsuleId:capsule.id,data:{name:'Smoke access',grantee:email,audience:'Named user',purposes:'learning',usageLimit:5,days:1,aiTrainingAllowed:false,commercialUse:false,derivativeUse:false}});
+const grant=workspace.licenses[0];
+const conversation=await call(`/capsules/${capsule.id}/conversations`,{version:'1.0.0',purpose:'learning'});
+const messagePath=`/capsules/${capsule.id}/conversations/${conversation.id}/messages`;
+const answer=await call(messagePath,{query:'What should I check before replacing equipment?',version:'1.0.0',purpose:'learning',idempotencyKey:randomUUID()});
+assert.equal(answer.abstained,false);assert.ok(answer.citations.length);
+const unsupported=await call(messagePath,{query:'What is the best chocolate cake recipe?',version:'1.0.0',purpose:'learning',idempotencyKey:randomUUID()});
+assert.equal(unsupported.abstained,true);
+await call('/workspace/actions',{type:'revoke',id:grant.id});
+await call(messagePath,{query:'What should I check before replacing equipment?',version:'1.0.0',purpose:'learning',idempotencyKey:randomUUID()},403);
+console.log('PASS cited answers, unsupported abstention, and revocation');
+console.log('Live smoke passed. Synthetic fixture retained for inspection; no blockchain transaction submitted.');
