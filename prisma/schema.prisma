@@ -15,6 +15,35 @@ model User {
   stellarPublicKey String? @unique
   createdAt DateTime @default(now())
 }
+model Organization {
+  id String @id @default(uuid())
+  name String
+  slug String @unique
+  createdAt DateTime @default(now())
+}
+model OrganizationMembership {
+  id String @id @default(uuid())
+  organizationId String
+  userId String
+  role String @default("MEMBER")
+  totpSecret String?
+  totpEnabled Boolean @default(false)
+  createdAt DateTime @default(now())
+  @@unique([organizationId,userId])
+  @@index([userId])
+}
+model ExpertCredential {
+  id String @id @default(uuid())
+  expertId String
+  type String
+  issuer String
+  evidenceObjectKey String?
+  verificationStatus String @default("PENDING")
+  reviewedBy String?
+  reviewedAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([expertId])
+}
 model Session {
   id String @id
   userId String
@@ -25,6 +54,7 @@ model Session {
 model Capsule {
   id String @id @default(uuid())
   ownerId String
+  ownerType String @default("USER")
   title String
   slug String @unique
   domain String
@@ -79,6 +109,9 @@ model CapsuleVersion {
   manifest Json
   knowledge Json
   evaluation Json
+  stellarTxHash String?
+  stellarAnchoredAt DateTime?
+  stellarLedger Int?
   publishedAt DateTime @default(now())
   @@unique([capsuleId,version])
 }
@@ -135,6 +168,9 @@ model LicenseGrant {
   startsAt DateTime @default(now())
   expiresAt DateTime
   status String @default("ACTIVE")
+  stellarTxHash String?
+  stellarAnchoredAt DateTime?
+  stellarRevokeTxHash String?
   createdAt DateTime @default(now())
   @@index([capsuleId,grantee,status])
   @@index([ownerId])
@@ -191,6 +227,7 @@ model InterviewSegment {
   interviewId String
   sequence Int
   objectKey String
+  contentType String @default("audio/webm")
   sha256 String
   text String @default("")
   @@unique([interviewId,sequence])

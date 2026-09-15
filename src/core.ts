@@ -6,6 +6,7 @@ import {
 } from "@nestjs/common";
 import {
   createHash,
+  createHmac,
   randomBytes,
   scrypt as scryptCallback,
   timingSafeEqual,
@@ -161,6 +162,82 @@ export function principalRequired(user: Principal | undefined): Principal {
   if (!user)
     throw new UnauthorizedException("Sign in to access your workspace.");
   return user;
+}
+
+// ─── TOTP (RFC 6238) for organization-admin MFA (PRD §21) ──────────────────
+// Self-contained (no external dependency) HMAC-SHA1, 6-digit, 30s-step TOTP,
+// matching the algorithm every standard authenticator app (Google
+// Authenticator, Authy, 1Password, etc.) implements.
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+export function randomBase32Secret(byteLength = 20): string {
+  const buf = randomBytes(byteLength);
+  let bits = 0;
+  let value = 0;
+  let output = "";
+  for (const byte of buf) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) output += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  return output;
+}
+function base32Decode(input: string): Buffer {
+  const clean = input.toUpperCase().replace(/[^A-Z2-7]/g, "");
+  let bits = 0;
+  let value = 0;
+  const bytes: number[] = [];
+  for (const char of clean) {
+    const idx = BASE32_ALPHABET.indexOf(char);
+    if (idx === -1) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(bytes);
+}
+function totpAt(secret: string, counter: number, digits = 6): string {
+  const key = base32Decode(secret);
+  const buf = Buffer.alloc(8);
+  buf.writeUInt32BE(Math.floor(counter / 2 ** 32), 0);
+  buf.writeUInt32BE(counter % 2 ** 32, 4);
+  const digest = createHmac("sha1", key).update(buf).digest();
+  const offset = digest[digest.length - 1] & 0xf;
+  const binCode =
+    ((digest[offset] & 0x7f) << 24) |
+    ((digest[offset + 1] & 0xff) << 16) |
+    ((digest[offset + 2] & 0xff) << 8) |
+    (digest[offset + 3] & 0xff);
+  return (binCode % 10 ** digits).toString().padStart(digits, "0");
+}
+export function totpUri(
+  secret: string,
+  label: string,
+  issuer = "Synapse",
+): string {
+  return `otpauth://totp/${encodeURIComponent(issuer)}:${encodeURIComponent(label)}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
+}
+export function verifyTotp(
+  secret: string,
+  token: string,
+  windowSteps = 1,
+  stepSeconds = 30,
+): boolean {
+  if (!/^\d{6}$/.test(token)) return false;
+  const counter = Math.floor(Date.now() / 1000 / stepSeconds);
+  for (let error = -windowSteps; error <= windowSteps; error++) {
+    const candidate = totpAt(secret, counter + error);
+    const a = Buffer.from(candidate);
+    const b = Buffer.from(token);
+    if (a.length === b.length && timingSafeEqual(a, b)) return true;
+  }
+  return false;
 }
 
 export function scanContent(text: string): { safe: boolean; reason?: string } {

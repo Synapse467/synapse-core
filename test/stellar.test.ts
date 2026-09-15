@@ -1,52 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { StellarService } from "../src/stellar";
-import { hash, canonical } from "../src/core";
 
-describe("StellarService anchoring and settlement", () => {
+describe("StellarService.settleRevenueSplit (pure arithmetic, no network)", () => {
   const service = new StellarService();
 
-  it("produces deterministic anchor results for capsule versions", async () => {
-    const payload = {
-      capsuleId: "capsule-123",
-      version: "1.0.0",
-      manifestHash: hash("manifest-content-v1"),
-      evaluationHash: hash("eval-content-v1"),
-    };
-
-    const res1 = await service.anchorCapsuleVersion(payload);
-    const res2 = await service.anchorCapsuleVersion(payload);
-
-    expect(res1.txHash).toBe(res2.txHash);
-    expect(res1.manifestHash).toBe(payload.manifestHash);
-    expect(res1.explorerUrl).toContain(res1.txHash);
-    expect(res1.ledgerSequence).toBeGreaterThan(48000000);
-  });
-
-  it("anchors license grants and usage receipts with verifiable hashes", async () => {
-    const licensePayload = {
-      licenseId: "lic-456",
-      capsuleId: "capsule-123",
-      grantee: "expert@domain.test",
-      termsHash: hash("standard-academic-terms"),
-      startsAt: new Date(Date.now() - 1000),
-      expiresAt: new Date(Date.now() + 86400000),
-    };
-
-    const licRes = await service.anchorLicenseGrant(licensePayload);
-    expect(licRes.txHash).toBe(hash(`stellar:license:${licensePayload.licenseId}:${licensePayload.termsHash}`));
-
-    const usagePayload = {
-      receiptId: "rec-789",
-      licenseId: "lic-456",
-      usageManifestHash: hash("batch-10-queries"),
-      period: 20260901,
-    };
-
-    const usageRes = await service.anchorUsageReceipt(usagePayload);
-    expect(usageRes.txHash).toBe(hash(`stellar:usage:${usagePayload.receiptId}:${usagePayload.usageManifestHash}`));
-  });
-
-  it("settles revenue splits without loss of rounding remainders", async () => {
+  it("computes payouts without loss of rounding remainders", async () => {
     const settlementPayload = {
       settlementId: "set-001",
       totalAmount: 100001, // Odd number to test remainder distribution
@@ -67,5 +25,28 @@ describe("StellarService anchoring and settlement", () => {
     expect(receipt.payouts[0].amount).toBe(50000);
     expect(receipt.payouts[1].amount).toBe(25000);
     expect(receipt.payouts[2].amount).toBe(25001); // 100001 - 75000
+  });
+
+  it("rejects shares that do not sum to exactly 10000 bps", async () => {
+    await expect(
+      service.settleRevenueSplit({
+        settlementId: "set-002",
+        totalAmount: 1000,
+        assetCode: "USDC",
+        contributorShares: [{ recipient: "GA1...", shareBps: 9000 }],
+      }),
+    ).rejects.toThrow(/10000 bps/);
+  });
+
+  it("throws (never fabricates) when no Stellar signer is configured", async () => {
+    const unconfigured = new StellarService();
+    await expect(
+      unconfigured.anchorCapsuleVersion({
+        capsuleId: "c1",
+        version: "1.0.0",
+        manifestHash: "a".repeat(64),
+        evaluationHash: "b".repeat(64),
+      }),
+    ).rejects.toThrow(/not configured/);
   });
 });

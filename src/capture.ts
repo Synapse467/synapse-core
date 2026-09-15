@@ -20,7 +20,7 @@ import { parse, hash, ai } from "./core";
 @ApiTags("Capture")
 @Controller("v1/capsules/:id")
 export class CaptureController {
-  @Post('evaluations/cases') async addCase(@Param('id') id:string,@Req() req:FastifyRequest,@Body() body:unknown){const user=await this.auth.user(req);await this.workspace.owned(user,id);const value=parse(z.object({question:z.string().trim().min(5).max(4000),expectedElements:z.array(z.string().min(1).max(2000)).max(30),forbiddenElements:z.array(z.string().min(1).max(2000)).max(30).default([]),unsupported:z.boolean().default(false)}).refine(v=>v.unsupported||v.expectedElements.length>0,'Supported cases need expected answer elements.'),body);return this.db.$transaction(async tx=>{const result=await tx.evaluationCase.create({data:{...value,capsuleId:id,approvedBy:user.id}});await tx.capsule.update({where:{id},data:{revision:{increment:1}}});return result;});}
+  @Post('evaluations/cases') async addCase(@Param('id') id:string,@Req() req:FastifyRequest,@Body() body:unknown){const user=await this.auth.user(req);await this.workspace.owned(user,id);const value=parse(z.object({question:z.string().trim().min(5).max(4000),expectedElements:z.array(z.string().min(1).max(2000)).max(30).default([]),forbiddenElements:z.array(z.string().min(1).max(2000)).max(30).default([]),unsupported:z.boolean().default(false)}).refine(v=>v.unsupported||v.expectedElements.length>0,'Supported cases need expected answer elements.'),body);return this.db.$transaction(async tx=>{const result=await tx.evaluationCase.create({data:{...value,capsuleId:id,approvedBy:user.id}});await tx.capsule.update({where:{id},data:{revision:{increment:1}}});return result;});}
   constructor(
     private db: Database,
     private storage: Storage,
@@ -182,13 +182,15 @@ export class CaptureController {
     const bytes = await this.storage.read(ticket.objectKey);
     if (hash(bytes) !== value.sha256 || bytes.length !== ticket.size)
       throw new BadRequestException("Audio integrity validation failed.");
-    return this.db.interviewSegment.upsert({
+    const created = await this.db.interviewSegment.upsert({
       where: {
         interviewId_sequence: { interviewId, sequence: value.sequence },
       },
-      create: { interviewId, ...value },
+      create: { interviewId, ...value, contentType: ticket.contentType },
       update: {},
     });
+    await this.jobs.enqueueTranscription(created.id, interviewId, id, value.sequence);
+    return created;
   }
   @Post("interviews/:interviewId/complete") async complete(
     @Param("id") id: string,
@@ -221,11 +223,18 @@ export class CaptureController {
       where: { id: interviewId },
       data: { status: "CAPTURED" },
     });
+    // Re-enqueue transcription for any segment a prior enqueue may have
+    // missed (e.g. a crash between upload and enqueue) — idempotent, since
+    // the worker skips a segment that already has transcript text.
+    for (const chunk of chunks)
+      if (!chunk.text)
+        await this.jobs.enqueueTranscription(chunk.id, interviewId, id, chunk.sequence);
+    const transcribed = chunks.every((c) => c.text);
     return {
       id: interviewId,
       status: "CAPTURED",
       segments: chunks.length,
-      transcriptionStatus: "PENDING",
+      transcriptionStatus: transcribed ? "COMPLETE" : "PENDING",
     };
   }
   @Post("interviews/:interviewId/next-question") async followup(

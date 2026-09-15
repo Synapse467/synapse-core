@@ -12,12 +12,21 @@ import rateLimit from "@fastify/rate-limit";
 import { Database } from "./database";
 import { Storage } from "./storage";
 import { Jobs } from "./jobs";
+import { StellarService } from "./stellar";
 import { WorkspaceService } from "./workspace";
 import { ProductController } from "./controller";
 import { CaptureController } from "./capture";
+import { OrganizationsController } from "./organizations";
 @Module({
-  controllers: [ProductController, CaptureController],
-  providers: [Database, Storage, Jobs, WorkspaceService, ProductController],
+  controllers: [ProductController, CaptureController, OrganizationsController],
+  providers: [
+    Database,
+    Storage,
+    Jobs,
+    StellarService,
+    WorkspaceService,
+    ProductController,
+  ],
 })
 class AppModule {}
 async function main() {
