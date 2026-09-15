@@ -74,7 +74,8 @@ async function main() {
   app.enableShutdownHooks();
   await app.listen(Number(process.env.PORT || 4000), "127.0.0.1");
 }
-main().catch(() => {
+main().catch((err) => {
+  console.error(err);
   process.stderr.write(
     "Synapse API could not start. Check database, queue, and environment configuration.\n",
   );
