@@ -90,6 +90,7 @@ export type Principal = {
   bio: string;
   domain: string;
   verificationStatus: string;
+  stellarPublicKey?: string | null;
 };
 export type ApprovedItem = {
   id: string;

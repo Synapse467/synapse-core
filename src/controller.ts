@@ -14,6 +14,7 @@ import {
 import { ApiTags, ApiOperation, ApiBody } from "@nestjs/swagger";
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { randomBytes } from "node:crypto";
+import { Keypair } from "@stellar/stellar-sdk";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { Database } from "./database";
@@ -29,6 +30,22 @@ import {
   type Principal,
   type ApprovedItem,
 } from "./core";
+
+// In-memory nonce store (per-process, short TTL)
+// In production this should be Redis with a 2-minute TTL
+const walletNonces = new Map<string, { nonce: string; expiresAt: number }>();
+const NONCE_TTL_MS = 2 * 60 * 1000; // 2 minutes
+function issueNonce(publicKey: string): string {
+  const nonce = randomBytes(32).toString("hex");
+  walletNonces.set(publicKey, { nonce, expiresAt: Date.now() + NONCE_TTL_MS });
+  return nonce;
+}
+function consumeNonce(publicKey: string, nonce: string): boolean {
+  const entry = walletNonces.get(publicKey);
+  if (!entry || entry.nonce !== nonce || Date.now() > entry.expiresAt) return false;
+  walletNonces.delete(publicKey);
+  return true;
+}
 @ApiTags("Synapse v1")
 @Controller("v1")
 export class ProductController {
@@ -132,6 +149,65 @@ export class ProductController {
     res.clearCookie("synapse_session", { path: "/" });
     return { ok: true };
   }
+
+  // ─── Freighter wallet auth ──────────────────────────────────────────
+
+  @Post("auth/wallet-challenge")
+  @ApiOperation({ summary: "Request a sign-in challenge nonce for a Stellar public key" })
+  async walletChallenge(@Body() body: unknown) {
+    const { publicKey } = parse(
+      z.object({ publicKey: z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key") }),
+      body,
+    );
+    const nonce = issueNonce(publicKey);
+    return { message: `Synapse sign-in: ${nonce}`, nonce };
+  }
+
+  @Post("auth/wallet-verify")
+  @ApiOperation({ summary: "Verify Freighter signature and open a session" })
+  async walletVerify(
+    @Body() body: unknown,
+    @Res({ passthrough: true }) res: FastifyReply,
+  ) {
+    const input = parse(
+      z.object({
+        publicKey: z.string().regex(/^G[A-Z2-7]{55}$/),
+        nonce: z.string().min(1),
+        signedMessage: z.string().min(1),
+        displayName: z.string().trim().min(2).max(120).optional(),
+      }),
+      body,
+    );
+    if (!consumeNonce(input.publicKey, input.nonce))
+      throw new UnauthorizedException("Challenge expired or invalid. Request a new one.");
+    let valid = false;
+    try {
+      const expectedMessage = `Synapse sign-in: ${input.nonce}`;
+      const msgBytes = Buffer.from(expectedMessage, "utf-8");
+      const sigBytes = Buffer.from(input.signedMessage, "base64");
+      const keypair = Keypair.fromPublicKey(input.publicKey);
+      valid = keypair.verify(msgBytes, sigBytes);
+    } catch {
+      throw new BadRequestException("Signature could not be decoded.");
+    }
+    if (!valid)
+      throw new UnauthorizedException("Wallet signature does not match the challenge.");
+    let user = await this.db.user.findFirst({ where: { stellarPublicKey: input.publicKey } });
+    if (!user) {
+      const syntheticEmail = `${input.publicKey.toLowerCase()}@wallet.synapse`;
+      user = await this.db.user.create({
+        data: {
+          email: syntheticEmail,
+          name: input.displayName ?? `Expert ${input.publicKey.slice(0, 8)}`,
+          passwordHash: "wallet-auth:no-password",
+          stellarPublicKey: input.publicKey,
+        },
+      });
+    }
+    await this.session(user.id, res);
+    return { id: user.id, name: user.name, email: user.email, stellarPublicKey: user.stellarPublicKey, authMethod: "wallet" };
+  }
+
   @Get("me") async me(@Req() req: FastifyRequest) {
     const u = await this.user(req);
     return {
@@ -141,6 +217,7 @@ export class ProductController {
       bio: u.bio,
       domain: u.domain,
       verificationStatus: u.verificationStatus,
+      stellarPublicKey: u.stellarPublicKey ?? null,
     };
   }
   @Get("workspace") async getWorkspace(@Req() req: FastifyRequest) {

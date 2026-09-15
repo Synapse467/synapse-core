@@ -12,6 +12,7 @@ model User {
   bio String @default("")
   domain String @default("")
   verificationStatus String @default("UNVERIFIED")
+  stellarPublicKey String? @unique
   createdAt DateTime @default(now())
 }
 model Session {
