@@ -18,6 +18,7 @@ import {
   capsuleInput,
   grantInput,
   scanContent,
+  redactPii,
   type Principal,
 } from "./core";
 const json = (value: unknown) =>
@@ -85,7 +86,7 @@ export class WorkspaceService {
       orderBy: { updatedAt: "desc" },
     });
     const ids = capsules.map((c) => c.id);
-    const [versions, sources, knowledge, licenses, evaluations, usage] =
+    const [versions, sources, knowledge, licenses, evaluations, usage, settlements, receipts] =
       await Promise.all([
         this.db.capsuleVersion.findMany({ where: { capsuleId: { in: ids } } }),
         this.db.sourceAsset.findMany({
@@ -106,6 +107,16 @@ export class WorkspaceService {
           orderBy: { occurredAt: "desc" },
           take: 500,
         }),
+        this.db.settlementEvent.findMany({
+          where: { capsuleId: { in: ids } },
+          orderBy: { createdAt: "desc" },
+          take: 200,
+        }),
+        this.db.usageReceiptBatch.findMany({
+          where: { capsuleId: { in: ids } },
+          orderBy: { createdAt: "desc" },
+          take: 100,
+        }),
       ]);
     return {
       profile: {
@@ -113,6 +124,7 @@ export class WorkspaceService {
         email: user.email,
         bio: user.bio,
         domain: user.domain,
+        platformRole: user.platformRole,
       },
       capsules: capsules.map((c) => ({
         ...c,
@@ -127,6 +139,8 @@ export class WorkspaceService {
         (e, i, all) => all.findIndex((v) => v.capsuleId === e.capsuleId) === i,
       ),
       usage,
+      settlements,
+      receipts,
     };
   }
   async action(user: Principal, input: unknown) {
@@ -144,6 +158,8 @@ export class WorkspaceService {
           "publish",
           "grant",
           "revoke",
+          "redact-source",
+          "delete-source",
         ]),
         capsuleId: z.string().optional(),
         id: z.string().optional(),
@@ -515,6 +531,8 @@ export class WorkspaceService {
               derivativeUse: value.derivativeUse,
               usageLimit: value.usageLimit,
               durationDays: value.days,
+              pricePerUnitMinor: value.pricePerUnitMinor,
+              assetCode: value.assetCode,
             },
           });
           const termsHash = hash(
@@ -542,6 +560,8 @@ export class WorkspaceService {
               derivativeUse: value.derivativeUse,
               usageLimit: value.usageLimit,
               expiresAt,
+              pricePerUnitMinor: value.pricePerUnitMinor,
+              assetCode: value.assetCode,
             },
           });
           anchorJobId = `license-anchor-${grant.id}`;
@@ -564,6 +584,70 @@ export class WorkspaceService {
           });
         });
         if (anchorJobId) await this.jobs.enqueueStellarJob(anchorJobId);
+      } else if (action.type === "redact-source") {
+        const sourceId = parse(z.string().uuid(), action.id);
+        const source = await this.db.sourceAsset.findFirst({
+          where: { id: sourceId, capsuleId: capsule.id },
+        });
+        if (!source) throw new NotFoundException("Source not found.");
+        const redacted = redactPii(source.text);
+        await this.db.$transaction(async (tx) => {
+          await tx.sourceAsset.update({
+            where: { id: source.id },
+            data: { text: redacted.text },
+          });
+          const pending = await tx.knowledgeItem.findMany({
+            where: { sourceId: source.id, status: "PENDING" },
+          });
+          for (const item of pending) {
+            const next = redactPii(item.text);
+            if (next.replacements)
+              await tx.knowledgeItem.update({
+                where: { id: item.id },
+                data: { text: next.text, proposal: redactPii(item.proposal).text },
+              });
+          }
+          await tx.auditEvent.create({
+            data: {
+              actorId: user.id,
+              capsuleId: capsule.id,
+              action: "source.redacted",
+              entityId: source.id,
+              metadata: { replacements: redacted.replacements },
+            },
+          });
+        });
+      } else if (action.type === "delete-source") {
+        const sourceId = parse(z.string().uuid(), action.id);
+        const source = await this.db.sourceAsset.findFirst({
+          where: { id: sourceId, capsuleId: capsule.id },
+        });
+        if (!source) throw new NotFoundException("Source not found.");
+        const versions = await this.db.capsuleVersion.findMany({
+          where: { capsuleId: capsule.id },
+        });
+        const published = versions.some((version) => {
+          const knowledge = version.knowledge as Array<{ sourceId?: string }>;
+          return Array.isArray(knowledge) && knowledge.some((item) => item.sourceId === source.id);
+        });
+        if (published)
+          throw new ForbiddenException(
+            "This source is part of a published capsule version and cannot be deleted. Publish a corrected version instead.",
+          );
+        await this.db.$transaction(async (tx) => {
+          await tx.knowledgeItem.deleteMany({ where: { sourceId: source.id } });
+          await tx.sourceAsset.delete({ where: { id: source.id } });
+          await tx.auditEvent.create({
+            data: {
+              actorId: user.id,
+              capsuleId: capsule.id,
+              action: "source.deleted",
+              entityId: source.id,
+              metadata: { objectKey: source.objectKey },
+            },
+          });
+        });
+        if (source.objectKey) await this.storage.remove(source.objectKey);
       } else throw new ForbiddenException("Unsupported workspace action.");
     }
     return this.snapshot(user);

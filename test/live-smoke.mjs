@@ -69,6 +69,17 @@ console.log('PASS organization-owned capsule creation and membership-scoped visi
 await call('/experts/me/verification',{type:'LICENSE',issuer:'Synthetic Standards Board'});
 const credentials=await call('/experts/me/credentials');
 assert.equal(credentials[0].verificationStatus,'PENDING');
+await call(`/experts/credentials/${credentials[0].id}/review`,{status:'APPROVED'},403);
 console.log('PASS expert credential evidence submission');
+workspace=await call('/workspace/actions',{type:'add-source',capsuleId:capsule.id,data:{title:'PII note',type:'NOTE',text:'Call the expert at expert-contact@example.test before replacing parts.'}});
+workspace=await call('/workspace/actions',{type:'redact-source',capsuleId:capsule.id,id:workspace.sources.find(s=>s.title==='PII note').id});
+assert.ok(workspace.sources.find(s=>s.title==='PII note').text.includes('[REDACTED]'));
+const licenses=await call('/me/licenses');
+assert.ok(Array.isArray(licenses));
+const usage=await call(`/capsules/${capsule.id}/usage`);
+assert.ok(Array.isArray(usage));
+const settlements=await call(`/capsules/${capsule.id}/settlements`);
+assert.ok(Array.isArray(settlements.settlements));
+console.log('PASS redaction and PRD usage/settlement/license read aliases');
 
 console.log('Live smoke passed. Synthetic fixture retained for inspection; no blockchain transaction submitted.');

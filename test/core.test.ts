@@ -7,6 +7,9 @@ import {
   verifyPassword,
   ensureLicense,
   scanContent,
+  scanBinary,
+  redactPii,
+  isPlatformReviewer,
   randomBase32Secret,
   totpUri,
   verifyTotp,
@@ -115,5 +118,31 @@ describe("TOTP (organization-admin MFA, PRD §21)", () => {
     expect(verifyTotp(secret, "abcdef")).toBe(false);
     expect(verifyTotp(secret, "12345")).toBe(false);
     expect(verifyTotp(secret, "")).toBe(false);
+  });
+});
+describe("redaction, file scan, and platform roles", () => {
+  it("redacts emails and card-like numbers", () => {
+    const result = redactPii("Contact jane@example.test about 4111 1111 1111 1111");
+    expect(result.text).not.toContain("jane@example.test");
+    expect(result.text).not.toContain("4111");
+    expect(result.replacements).toBeGreaterThan(0);
+  });
+  it("rejects the EICAR test file and PE executables", () => {
+    const eicar =
+      "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+    expect(scanBinary(Buffer.from(eicar), "notes.txt").safe).toBe(false);
+    expect(scanBinary(Buffer.from("MZ\x90\x00"), "resume.pdf").safe).toBe(false);
+    expect(scanBinary(Buffer.from("Ordinary notes"), "notes.txt").safe).toBe(true);
+  });
+  it("treats ADMIN and REVIEWER roles as platform reviewers", () => {
+    expect(
+      isPlatformReviewer({ platformRole: "ADMIN", email: "a@example.test" }),
+    ).toBe(true);
+    expect(
+      isPlatformReviewer({ platformRole: "REVIEWER", email: "r@example.test" }),
+    ).toBe(true);
+    expect(
+      isPlatformReviewer({ platformRole: "NONE", email: "u@example.test" }),
+    ).toBe(false);
   });
 });

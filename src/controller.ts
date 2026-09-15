@@ -27,25 +27,11 @@ import {
   hash,
   ensureLicense,
   ai,
+  bootstrapPlatformRole,
   type Principal,
   type ApprovedItem,
 } from "./core";
-
-// In-memory nonce store (per-process, short TTL)
-// In production this should be Redis with a 2-minute TTL
-const walletNonces = new Map<string, { nonce: string; expiresAt: number }>();
-const NONCE_TTL_MS = 2 * 60 * 1000; // 2 minutes
-function issueNonce(publicKey: string): string {
-  const nonce = randomBytes(32).toString("hex");
-  walletNonces.set(publicKey, { nonce, expiresAt: Date.now() + NONCE_TTL_MS });
-  return nonce;
-}
-function consumeNonce(publicKey: string, nonce: string): boolean {
-  const entry = walletNonces.get(publicKey);
-  if (!entry || entry.nonce !== nonce || Date.now() > entry.expiresAt) return false;
-  walletNonces.delete(publicKey);
-  return true;
-}
+import { issueWalletNonce, consumeWalletNonce } from "./nonce";
 @ApiTags("Synapse v1")
 @Controller("v1")
 export class ProductController {
@@ -65,6 +51,14 @@ export class ProductController {
       where: { id: session.userId },
     });
     if (!user) throw new UnauthorizedException();
+    const role = await bootstrapPlatformRole(user);
+    if (role !== user.platformRole) {
+      await this.db.user.update({
+        where: { id: user.id },
+        data: { platformRole: role },
+      });
+      user.platformRole = role;
+    }
     return user;
   }
   private async session(userId: string, res: FastifyReply) {
@@ -159,7 +153,7 @@ export class ProductController {
       z.object({ publicKey: z.string().regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar public key") }),
       body,
     );
-    const nonce = issueNonce(publicKey);
+    const nonce = await issueWalletNonce(publicKey);
     return { message: `Synapse sign-in: ${nonce}`, nonce };
   }
 
@@ -178,7 +172,7 @@ export class ProductController {
       }),
       body,
     );
-    if (!consumeNonce(input.publicKey, input.nonce))
+    if (!(await consumeWalletNonce(input.publicKey, input.nonce)))
       throw new UnauthorizedException("Challenge expired or invalid. Request a new one.");
     let valid = false;
     try {
@@ -218,6 +212,7 @@ export class ProductController {
       domain: u.domain,
       verificationStatus: u.verificationStatus,
       stellarPublicKey: u.stellarPublicKey ?? null,
+      platformRole: u.platformRole,
     };
   }
   @Get("workspace") async getWorkspace(@Req() req: FastifyRequest) {
@@ -484,6 +479,43 @@ export class ProductController {
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
+  }
+  @Get("me/licenses")
+  @ApiOperation({ summary: "List licenses granted to or by the caller" })
+  async myLicenses(@Req() req: FastifyRequest) {
+    const user = await this.user(req);
+    return this.db.licenseGrant.findMany({
+      where: { OR: [{ grantee: user.email }, { ownerId: user.id }] },
+      orderBy: { createdAt: "desc" },
+    });
+  }
+  @Get("capsules/:id/usage")
+  @ApiOperation({ summary: "Usage events for a capsule the caller owns" })
+  async capsuleUsage(@Param("id") id: string, @Req() req: FastifyRequest) {
+    await this.workspace.owned(await this.user(req), id);
+    return this.db.usageEvent.findMany({
+      where: { capsuleId: id },
+      orderBy: { occurredAt: "desc" },
+      take: 500,
+    });
+  }
+  @Get("capsules/:id/settlements")
+  @ApiOperation({ summary: "Settlement events for a capsule the caller owns" })
+  async capsuleSettlements(@Param("id") id: string, @Req() req: FastifyRequest) {
+    await this.workspace.owned(await this.user(req), id);
+    const [settlements, receipts] = await Promise.all([
+      this.db.settlementEvent.findMany({
+        where: { capsuleId: id },
+        orderBy: { createdAt: "desc" },
+        take: 200,
+      }),
+      this.db.usageReceiptBatch.findMany({
+        where: { capsuleId: id },
+        orderBy: { createdAt: "desc" },
+        take: 100,
+      }),
+    ]);
+    return { settlements, receipts };
   }
   @Get("health") async health() {
     await this.db.$queryRaw`SELECT 1`;

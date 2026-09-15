@@ -83,6 +83,8 @@ export const grantInput = z.object({
   derivativeUse: z.boolean().default(false),
   usageLimit: z.coerce.number().int().min(1).max(1000000),
   days: z.coerce.number().int().min(1).max(3650),
+  pricePerUnitMinor: z.coerce.number().int().min(0).max(1_000_000_000).default(0),
+  assetCode: z.string().trim().min(1).max(12).default("USD"),
 });
 export type Principal = {
   id: string;
@@ -92,6 +94,7 @@ export type Principal = {
   domain: string;
   verificationStatus: string;
   stellarPublicKey?: string | null;
+  platformRole: string;
 };
 export type ApprovedItem = {
   id: string;
@@ -259,5 +262,149 @@ export function scanContent(text: string): { safe: boolean; reason?: string } {
     }
   }
   return { safe: true };
+}
+
+/** Industry-standard inert antivirus test file (https://www.eicar.org/). */
+export const EICAR_SIGNATURE =
+  "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+const EXECUTABLE_MAGIC: Buffer[] = [
+  Buffer.from("MZ"),
+  Buffer.from([0x7f, 0x45, 0x4c, 0x46]),
+  Buffer.from([0xfe, 0xed, 0xfa, 0xce]),
+  Buffer.from([0xfe, 0xed, 0xfa, 0xcf]),
+  Buffer.from([0xca, 0xfe, 0xba, 0xbe]),
+  Buffer.from([0xcf, 0xfa, 0xed, 0xfe]),
+];
+
+export function scanBinary(
+  content: Buffer,
+  filename: string,
+): { safe: boolean; reason?: string } {
+  if (content.includes(Buffer.from(EICAR_SIGNATURE)))
+    return {
+      safe: false,
+      reason: "Rejected: file matches the EICAR antivirus test signature.",
+    };
+  if (EXECUTABLE_MAGIC.some((magic) => content.subarray(0, magic.length).equals(magic)))
+    return {
+      safe: false,
+      reason: `Rejected: '${filename}' is a compiled executable, not a source document.`,
+    };
+  return { safe: true };
+}
+
+/**
+ * Heuristic scan plus optional real ClamAV. If `CLAMAV_REQUIRED=true` and
+ * `CLAMAV_CMD` is unset/unusable, this throws — it never reports "clean"
+ * when the configured production scanner cannot actually run.
+ */
+export async function scanUploadedFile(
+  content: Buffer,
+  filename: string,
+): Promise<{ safe: boolean; reason?: string }> {
+  const heuristic = scanBinary(content, filename);
+  if (!heuristic.safe) return heuristic;
+  const cmd = (process.env.CLAMAV_CMD || "").trim();
+  const required = process.env.CLAMAV_REQUIRED === "true";
+  if (!cmd) {
+    if (required)
+      throw new ServiceUnavailableException(
+        "File scanning is required (CLAMAV_REQUIRED=true) but CLAMAV_CMD is not configured.",
+      );
+    return { safe: true };
+  }
+  const { mkdtemp, writeFile, unlink, rmdir } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFile } = await import("node:child_process");
+  const dir = await mkdtemp(join(tmpdir(), "synapse-scan-"));
+  const file = join(dir, filename.replace(/[^A-Za-z0-9._-]+/g, "_") || "upload.bin");
+  await writeFile(file, content);
+  try {
+    const [bin, ...args] = cmd.split(/\s+/);
+    await new Promise<void>((resolve, reject) => {
+      execFile(bin, [...args, file], { timeout: 30000 }, (err, stdout, stderr) => {
+        const output = `${stdout || ""}${stderr || ""}`;
+        if (!err) return resolve();
+        if (typeof err.code === "number" && err.code === 1)
+          return reject(
+            Object.assign(new Error("Rejected: ClamAV reported malware."), {
+              clamav: true,
+              output,
+            }),
+          );
+        reject(err);
+      });
+    });
+    return { safe: true };
+  } catch (err) {
+    if (err && typeof err === "object" && "clamav" in err)
+      return { safe: false, reason: "Rejected: ClamAV reported malware." };
+    if (required)
+      throw new ServiceUnavailableException(
+        "Configured ClamAV scanner could not run. Refusing to accept the upload as clean.",
+      );
+    throw new ServiceUnavailableException(
+      "File scanner failed. Retry after the scanning service is healthy.",
+    );
+  } finally {
+    await unlink(file).catch(() => undefined);
+    await rmdir(dir).catch(() => undefined);
+  }
+}
+
+export async function bootstrapPlatformRole(user: {
+  id: string;
+  email: string;
+  platformRole: string;
+}): Promise<string> {
+  if (user.platformRole !== "NONE") return user.platformRole;
+  const email = user.email.toLowerCase();
+  if (platformAdminEmails().includes(email)) return "ADMIN";
+  const reviewers = (process.env.PLATFORM_REVIEWER_EMAILS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (reviewers.includes(email)) return "REVIEWER";
+  return "NONE";
+}
+
+/** PRD §21 transcript redaction: replace emails, phones, SSNs, and card-like numbers. */
+export function redactPii(text: string): { text: string; replacements: number } {
+  const patterns: RegExp[] = [
+    /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
+    /\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?){2}\d{4}\b/g,
+    /\b\d{3}-\d{2}-\d{4}\b/g,
+    /\b(?:\d[ -]*?){13,19}\b/g,
+  ];
+  let replacements = 0;
+  let next = text;
+  for (const pattern of patterns) {
+    next = next.replace(pattern, () => {
+      replacements += 1;
+      return "[REDACTED]";
+    });
+  }
+  return { text: next, replacements };
+}
+
+export function platformAdminEmails(): string[] {
+  return (process.env.PLATFORM_ADMIN_EMAILS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+export function isPlatformReviewer(user: {
+  platformRole: string;
+  email: string;
+}): boolean {
+  if (user.platformRole === "ADMIN" || user.platformRole === "REVIEWER")
+    return true;
+  const extra = (process.env.PLATFORM_REVIEWER_EMAILS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  return extra.includes(user.email.toLowerCase());
 }
 

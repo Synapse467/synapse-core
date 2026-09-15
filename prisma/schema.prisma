@@ -13,6 +13,14 @@ model User {
   domain String @default("")
   verificationStatus String @default("UNVERIFIED")
   stellarPublicKey String? @unique
+  // Real, DB-backed platform-level role (NONE | REVIEWER | ADMIN), replacing
+  // the pure env-var allowlist for credential review/moderation (PRD §21).
+  // `PLATFORM_ADMIN_EMAILS` only ever bootstraps the very first ADMIN(s) on
+  // first authenticated request — every real system needs one initial
+  // trusted operator — after which role changes go through
+  // POST /v1/admin/platform-roles, gated on already being ADMIN. See
+  // organizations.ts and README.
+  platformRole String @default("NONE")
   createdAt DateTime @default(now())
 }
 model Organization {
@@ -148,6 +156,11 @@ model LicenseTemplate {
   derivativeUse Boolean @default(false)
   usageLimit Int
   durationDays Int
+  // PRD §19 usage/settlement: revenue generated per usage unit consumed
+  // under this template. 0 (the default) means a free/non-commercial
+  // capsule — no settlement is ever computed for it.
+  pricePerUnitMinor Int @default(0)
+  assetCode String @default("USD")
   createdAt DateTime @default(now())
   @@index([capsuleId])
 }
@@ -165,6 +178,8 @@ model LicenseGrant {
   derivativeUse Boolean @default(false)
   usageLimit Int
   used Int @default(0)
+  pricePerUnitMinor Int @default(0)
+  assetCode String @default("USD")
   startsAt DateTime @default(now())
   expiresAt DateTime
   status String @default("ACTIVE")
@@ -202,7 +217,40 @@ model UsageEvent {
   units Int @default(1)
   requestKey String @unique
   occurredAt DateTime @default(now())
+  // PRD §17/§19: usage-receipt batching anchors proof-of-usage on-chain
+  // (UsageReceiptRegistry.record); settlement pays out priced usage
+  // (Settlement.settle_split). Both are periodic batch jobs (jobs.ts) that
+  // reserve events via these two independent flags so a BullMQ retry can
+  // never double-batch or double-settle the same event.
+  receiptBatchId String?
+  settled Boolean @default(false)
   @@index([capsuleId,occurredAt])
+  @@index([capsuleId,receiptBatchId])
+  @@index([capsuleId,settled])
+}
+model UsageReceiptBatch {
+  id String @id @default(uuid())
+  capsuleId String
+  licenseId String
+  eventCount Int
+  usageManifestHash String
+  stellarTxHash String?
+  stellarAnchoredAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([capsuleId,createdAt])
+}
+model SettlementEvent {
+  id String @id @default(uuid())
+  settlementRef String
+  capsuleId String
+  contributorId String
+  amountMinor Int
+  assetCode String
+  status String @default("PENDING")
+  stellarTxHash String?
+  createdAt DateTime @default(now())
+  @@index([capsuleId,createdAt])
+  @@index([settlementRef])
 }
 model AuditEvent {
   id String @id @default(uuid())

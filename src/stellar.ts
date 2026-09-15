@@ -9,9 +9,9 @@ import {
   nativeToScVal,
   scValToNative,
   rpc,
+  xdr,
   type Transaction,
 } from "@stellar/stellar-sdk";
-import type { xdr } from "@stellar/stellar-sdk";
 import { hash } from "./core";
 
 export interface AnchorResult {
@@ -71,6 +71,7 @@ export class StellarService {
   private licenseRegistryId = process.env.STELLAR_LICENSE_CONTRACT_ID;
   private usageReceiptRegistryId =
     process.env.STELLAR_USAGE_CONTRACT_ID;
+  private settlementRegistryId = process.env.STELLAR_SETTLEMENT_CONTRACT_ID;
 
   constructor() {
     const secret = process.env.STELLAR_SIGNER_SECRET;
@@ -105,6 +106,24 @@ export class StellarService {
     if (!/^[a-f0-9]{64}$/i.test(hex))
       throw new Error(`Expected a 32-byte hex value, got: ${hex}`);
     return nativeToScVal(Buffer.from(hex, "hex"), { type: "bytes" });
+  }
+
+  /** Encodes one `settlement::ContributorShare { recipient: Address, share_bps: u32 }`
+   * Soroban struct as its wire representation (an ScMap keyed by field-name
+   * Symbols, matching how soroban-sdk derives struct (de)serialization) —
+   * there is no generated TS binding for this contract, so this is built by
+   * hand against the exact field names/order in contracts/settlement/src/lib.rs. */
+  private contributorShareScVal(recipient: string, shareBps: number): xdr.ScVal {
+    return xdr.ScVal.scvMap([
+      new xdr.ScMapEntry({
+        key: nativeToScVal("recipient", { type: "symbol" }),
+        val: new Address(recipient).toScVal(),
+      }),
+      new xdr.ScMapEntry({
+        key: nativeToScVal("share_bps", { type: "symbol" }),
+        val: nativeToScVal(shareBps, { type: "u32" }),
+      }),
+    ]);
   }
 
   /** Builds, simulates, prepares, signs, submits and polls a contract call to completion. Never fabricates a result. */
@@ -306,11 +325,61 @@ export class StellarService {
   }
 
   /**
-   * Computes a revenue split. This performs contract-verified arithmetic
-   * (matching `settlement.settle_split`'s basis-point/remainder logic) but,
-   * per PRD §17, actual asset movement/escrow is a later product decision —
-   * this returns the payout plan without moving funds. Not called from any
-   * product flow yet (no billing/payment method is wired); see README.
+   * Submits a REAL on-chain `settlement.settle_split` call (PRD §17/§19,
+   * `GET /capsules/:id/settlements`, `SettlementEvent`). This anchors an
+   * immutable, verifiable record of "capsule earned totalAmount, split
+   * these ways among these contributor addresses" on Stellar — it is the
+   * proof-of-split ledger entry the PRD's `Settlement` contract exists for.
+   *
+   * It does NOT move real-world funds/assets to contributors: the contract
+   * itself only records payout math (see contracts/settlement/src/lib.rs —
+   * `settle_split` has no Payment operation, only persistent storage of the
+   * computed `PayoutEntry` list). Actually disbursing real money to expert
+   * bank accounts/wallets is a separate, later business/legal integration
+   * (a real payment rail) — see README "Incomplete product requirements".
+   */
+  async anchorSettlement(payload: {
+    settlementRef: string;
+    totalAmountMinor: number;
+    contributorShares: Array<{ recipient: string; shareBps: number }>;
+  }): Promise<ReceiptAnchorResult & { payouts: Array<{ recipient: string; amount: number }> }> {
+    if (!this.settlementRegistryId)
+      throw new ServiceUnavailableException(
+        "STELLAR_SETTLEMENT_CONTRACT_ID is not configured.",
+      );
+    const totalBps = payload.contributorShares.reduce((sum, s) => sum + s.shareBps, 0);
+    if (totalBps !== 10000)
+      throw new Error("Contributor shares must sum to exactly 10000 bps.");
+    const signer = this.requireSigner();
+    const sharesScVal = xdr.ScVal.scvVec(
+      payload.contributorShares.map((s) =>
+        this.contributorShareScVal(s.recipient, s.shareBps),
+      ),
+    );
+    const result = await this.invoke(this.settlementRegistryId, "settle_split", [
+      this.bytes32(payload.settlementRef),
+      new Address(signer.publicKey()).toScVal(),
+      nativeToScVal(BigInt(payload.totalAmountMinor), { type: "i128" }),
+      sharesScVal,
+    ]);
+    const payoutEntries = (result.returnValue as Array<{ recipient: string; amount: bigint }>) || [];
+    return {
+      txHash: result.txHash,
+      anchoredAt: new Date().toISOString(),
+      contractId: this.settlementRegistryId,
+      explorerUrl: this.explorer(result.txHash),
+      payouts: payoutEntries.map((p) => ({
+        recipient: p.recipient,
+        amount: Number(p.amount),
+      })),
+    };
+  }
+
+  /**
+   * Off-chain preview of the same split arithmetic `settle_split` performs
+   * (basis-point/remainder handling), used by the settlements API to show a
+   * proposed payout plan before it is anchored on-chain. See
+   * `anchorSettlement` for the real on-chain call.
    */
   async settleRevenueSplit(payload: {
     settlementId: string;

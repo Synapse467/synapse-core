@@ -9,7 +9,12 @@ import { randomUUID } from "node:crypto";
 import { Database } from "./database";
 import { Storage } from "./storage";
 import { StellarService } from "./stellar";
-import { ai, hash, scanContent } from "./core";
+import { ai, hash, scanContent, scanUploadedFile } from "./core";
+import {
+  contributorSharePlan,
+  usageManifestHash,
+  usagePeriod,
+} from "./billing";
 import { z } from "zod";
 const extraction = z.object({
   items: z.array(
@@ -39,6 +44,8 @@ export class Jobs implements OnModuleInit, OnModuleDestroy {
   private stellarWorker?: Worker;
   private transcribeWorker?: Worker;
   private reconcile?: NodeJS.Timeout;
+  private usageBatchTimer?: NodeJS.Timeout;
+  private settlementTimer?: NodeJS.Timeout;
   constructor(
     private db: Database,
     private storage: Storage,
@@ -149,6 +156,22 @@ export class Jobs implements OnModuleInit, OnModuleDestroy {
       15000,
     );
     await this.requeue();
+    const usageMs = Number(process.env.USAGE_BATCH_INTERVAL_MS || 60000);
+    const settleMs = Number(process.env.SETTLEMENT_INTERVAL_MS || 60000);
+    this.usageBatchTimer = setInterval(
+      () =>
+        void this.batchUsageReceipts().catch((err) =>
+          this.logger.warn(`Usage-receipt batch deferred: ${String(err)}`),
+        ),
+      Math.max(15000, usageMs),
+    );
+    this.settlementTimer = setInterval(
+      () =>
+        void this.settlePricedUsage().catch((err) =>
+          this.logger.warn(`Settlement batch deferred: ${String(err)}`),
+        ),
+      Math.max(15000, settleMs),
+    );
   }
   async enqueue(sourceId: string, capsuleId: string) {
     const id = `source-${sourceId}`;
@@ -201,7 +224,15 @@ export class Jobs implements OnModuleInit, OnModuleDestroy {
     }
     const pendingAnchors = await this.db.jobRecord.findMany({
       where: {
-        kind: { in: ["stellar-publish", "license-anchor", "license-revoke"] },
+        kind: {
+          in: [
+            "stellar-publish",
+            "license-anchor",
+            "license-revoke",
+            "usage-batch",
+            "settlement",
+          ],
+        },
         status: { in: ["PENDING", "RETRYING"] },
       },
       take: 100,
@@ -225,6 +256,31 @@ export class Jobs implements OnModuleInit, OnModuleDestroy {
       const bytes = await this.storage.read(source.objectKey);
       if (hash(bytes) !== source.sha256)
         throw new Error("Source integrity mismatch");
+      const binaryScan = await scanUploadedFile(bytes, source.title);
+      if (!binaryScan.safe) {
+        await this.db.$transaction(async (tx) => {
+          const existing = await tx.jobRecord.findUnique({ where: { id } });
+          if (existing?.status === "COMPLETED") return;
+          await tx.sourceAsset.update({
+            where: { id: sourceId },
+            data: { status: "FLAGGED" },
+          });
+          await tx.jobRecord.update({
+            where: { id },
+            data: { status: "COMPLETED", lastError: binaryScan.reason },
+          });
+          await tx.auditEvent.create({
+            data: {
+              actorId: source.contributorId,
+              capsuleId: source.capsuleId,
+              action: "source.flagged",
+              entityId: sourceId,
+              metadata: { reason: binaryScan.reason },
+            },
+          });
+        });
+        return;
+      }
       const parsed = await ai<{ text: string }>("document", {
         capsuleId: source.capsuleId,
         sourceId,
@@ -372,6 +428,7 @@ export class Jobs implements OnModuleInit, OnModuleDestroy {
       contentType: segment.contentType,
       idempotencyKey: jobId,
       allowedScope: { interviewIds: [interview.id] },
+      retention: process.env.TRANSCRIPTION_RETENTION || "none",
     });
     await this.db.$transaction(async (tx) => {
       const existing = await tx.jobRecord.findUnique({ where: { id: jobId } });
@@ -445,6 +502,8 @@ export class Jobs implements OnModuleInit, OnModuleDestroy {
     if (record.kind === "stellar-publish") await this.anchorCapsulePublish(jobId, record);
     else if (record.kind === "license-anchor") await this.anchorLicenseGrant(jobId, record);
     else if (record.kind === "license-revoke") await this.anchorLicenseRevocation(jobId, record);
+    else if (record.kind === "usage-batch") await this.anchorUsageBatch(jobId, record);
+    else if (record.kind === "settlement") await this.anchorSettlement(jobId, record);
     else this.logger.warn(`Unknown Stellar job kind: ${record.kind}`);
   }
   private async anchorCapsulePublish(
@@ -592,8 +651,289 @@ export class Jobs implements OnModuleInit, OnModuleDestroy {
       JSON.stringify({ event: "stellar.license.revoked", jobId, txHash: result.txHash }),
     );
   }
+
+  /**
+   * PRD §17/§19 `usage-batch`: group un-receipted usage events per license,
+   * persist an opaque manifest (ids + units, never query text), then queue
+   * the on-chain UsageReceiptRegistry.record call. Idempotent: a retry that
+   * finds events already reserved to a batch is a no-op.
+   */
+  async batchUsageReceipts() {
+    const pending = await this.db.usageEvent.findMany({
+      where: { receiptBatchId: null },
+      take: 500,
+      orderBy: { occurredAt: "asc" },
+    });
+    const byLicense = new Map<string, typeof pending>();
+    for (const event of pending) {
+      const list = byLicense.get(event.licenseId) || [];
+      list.push(event);
+      byLicense.set(event.licenseId, list);
+    }
+    for (const [licenseId, events] of byLicense) {
+      const period = usagePeriod(events[events.length - 1].occurredAt);
+      const manifestHash = usageManifestHash({
+        licenseId,
+        period,
+        events: events.map((e) => ({ id: e.id, units: e.units })),
+      });
+      const batchId = randomUUID();
+      const reserved = await this.db.$transaction(async (tx) => {
+        const stillOpen = await tx.usageEvent.findMany({
+          where: { id: { in: events.map((e) => e.id) }, receiptBatchId: null },
+        });
+        if (!stillOpen.length) return null;
+        await tx.usageReceiptBatch.create({
+          data: {
+            id: batchId,
+            capsuleId: stillOpen[0].capsuleId,
+            licenseId,
+            eventCount: stillOpen.length,
+            usageManifestHash: manifestHash,
+          },
+        });
+        await tx.usageEvent.updateMany({
+          where: { id: { in: stillOpen.map((e) => e.id) } },
+          data: { receiptBatchId: batchId },
+        });
+        await tx.jobRecord.create({
+          data: {
+            id: `usage-batch-${batchId}`,
+            capsuleId: stillOpen[0].capsuleId,
+            kind: "usage-batch",
+            payload: { batchId, licenseId, period, usageManifestHash: manifestHash },
+            status: "PENDING",
+          },
+        });
+        return stillOpen[0].capsuleId;
+      });
+      if (reserved) await this.enqueueStellarJob(`usage-batch-${batchId}`);
+    }
+  }
+
+  /**
+   * PRD §17/§19 `settlement`: priced usage (`pricePerUnitMinor > 0`) that
+   * has not been settled is grouped per capsule, split among contributors
+   * with Stellar wallets, recorded as SettlementEvent rows, then queued
+   * for an on-chain settle_split. Free licenses (price 0) never settle.
+   */
+  async settlePricedUsage() {
+    const priced = await this.db.usageEvent.findMany({
+      where: { settled: false },
+      take: 500,
+      orderBy: { occurredAt: "asc" },
+    });
+    if (!priced.length) return;
+    const licenses = await this.db.licenseGrant.findMany({
+      where: { id: { in: [...new Set(priced.map((e) => e.licenseId))] } },
+    });
+    const licenseById = new Map(licenses.map((l) => [l.id, l]));
+    const byCapsule = new Map<string, typeof priced>();
+    for (const event of priced) {
+      const grant = licenseById.get(event.licenseId);
+      if (!grant || grant.pricePerUnitMinor <= 0) continue;
+      const list = byCapsule.get(event.capsuleId) || [];
+      list.push(event);
+      byCapsule.set(event.capsuleId, list);
+    }
+    for (const [capsuleId, events] of byCapsule) {
+      const totalMinor = events.reduce((sum, event) => {
+        const grant = licenseById.get(event.licenseId)!;
+        return sum + event.units * grant.pricePerUnitMinor;
+      }, 0);
+      if (totalMinor <= 0) continue;
+      const assetCode = licenseById.get(events[0].licenseId)?.assetCode || "USD";
+      const capsule = await this.db.capsule.findUnique({ where: { id: capsuleId } });
+      if (!capsule) continue;
+      const owner = await this.db.user.findUnique({ where: { id: capsule.ownerId } });
+      const knowledge = await this.db.knowledgeItem.findMany({
+        where: { capsuleId, status: "APPROVED" },
+        select: { contributorId: true },
+      });
+      const contributorIds = [...new Set(knowledge.map((k) => k.contributorId))];
+      const contributors = await this.db.user.findMany({
+        where: { id: { in: contributorIds } },
+        select: { id: true, stellarPublicKey: true },
+      });
+      const plan = contributorSharePlan(
+        {
+          contributorId: owner?.id || capsule.ownerId,
+          stellarPublicKey: owner?.stellarPublicKey || null,
+        },
+        contributors.map((c) => ({
+          contributorId: c.id,
+          stellarPublicKey: c.stellarPublicKey,
+        })),
+      );
+      const settlementRef = randomUUID();
+      const canAnchor = plan.every((share) => share.recipient);
+      await this.db.$transaction(async (tx) => {
+        const stillOpen = await tx.usageEvent.findMany({
+          where: { id: { in: events.map((e) => e.id) }, settled: false },
+        });
+        if (!stillOpen.length) return;
+        await tx.usageEvent.updateMany({
+          where: { id: { in: stillOpen.map((e) => e.id) } },
+          data: { settled: true },
+        });
+        for (const share of plan) {
+          const amount =
+            share === plan[plan.length - 1]
+              ? totalMinor -
+                plan
+                  .slice(0, -1)
+                  .reduce(
+                    (sum, item) =>
+                      sum + Math.floor((totalMinor * item.shareBps) / 10000),
+                    0,
+                  )
+              : Math.floor((totalMinor * share.shareBps) / 10000);
+          await tx.settlementEvent.create({
+            data: {
+              settlementRef,
+              capsuleId,
+              contributorId: share.contributorId,
+              amountMinor: amount,
+              assetCode,
+              status: canAnchor ? "PENDING" : "RECORDED_OFFCHAIN",
+            },
+          });
+        }
+        if (canAnchor) {
+          await tx.jobRecord.create({
+            data: {
+              id: `settlement-${settlementRef}`,
+              capsuleId,
+              kind: "settlement",
+              payload: {
+                settlementRef,
+                totalAmountMinor: totalMinor,
+                shares: plan,
+              },
+              status: "PENDING",
+            },
+          });
+        }
+      });
+      if (canAnchor) await this.enqueueStellarJob(`settlement-${settlementRef}`);
+      this.logger.log(
+        JSON.stringify({
+          event: "settlement.prepared",
+          capsuleId,
+          settlementRef,
+          totalMinor,
+          onChain: canAnchor,
+        }),
+      );
+    }
+  }
+
+  private async anchorUsageBatch(
+    jobId: string,
+    record: { capsuleId: string; payload: unknown },
+  ) {
+    const payload = record.payload as {
+      batchId: string;
+      licenseId: string;
+      period: number;
+      usageManifestHash: string;
+    };
+    const batch = await this.db.usageReceiptBatch.findUnique({
+      where: { id: payload.batchId },
+    });
+    if (batch?.stellarTxHash) {
+      await this.db.jobRecord.update({
+        where: { id: jobId },
+        data: { status: "COMPLETED", lastError: null },
+      });
+      return;
+    }
+    const result = await this.stellar.anchorUsageReceipt({
+      receiptId: payload.batchId,
+      licenseId: payload.licenseId,
+      usageManifestHash: payload.usageManifestHash,
+      period: payload.period,
+    });
+    await this.db.$transaction(async (tx) => {
+      const existing = await tx.jobRecord.findUnique({ where: { id: jobId } });
+      if (existing?.status === "COMPLETED") return;
+      await tx.usageReceiptBatch.update({
+        where: { id: payload.batchId },
+        data: {
+          stellarTxHash: result.txHash,
+          stellarAnchoredAt: new Date(result.anchoredAt),
+        },
+      });
+      await tx.jobRecord.update({
+        where: { id: jobId },
+        data: { status: "COMPLETED", lastError: null, result: { ...result } },
+      });
+    });
+    this.logger.log(
+      JSON.stringify({ event: "stellar.usage.receipt", jobId, txHash: result.txHash }),
+    );
+  }
+
+  private async anchorSettlement(
+    jobId: string,
+    record: { capsuleId: string; payload: unknown },
+  ) {
+    const payload = record.payload as {
+      settlementRef: string;
+      totalAmountMinor: number;
+      shares: Array<{
+        contributorId: string;
+        recipient: string | null;
+        shareBps: number;
+      }>;
+    };
+    const already = await this.db.settlementEvent.findFirst({
+      where: { settlementRef: payload.settlementRef, stellarTxHash: { not: null } },
+    });
+    if (already) {
+      await this.db.jobRecord.update({
+        where: { id: jobId },
+        data: { status: "COMPLETED", lastError: null },
+      });
+      return;
+    }
+    const shares = payload.shares.filter(
+      (s): s is { contributorId: string; recipient: string; shareBps: number } =>
+        Boolean(s.recipient),
+    );
+    const result = await this.stellar.anchorSettlement({
+      settlementRef: payload.settlementRef,
+      totalAmountMinor: payload.totalAmountMinor,
+      contributorShares: shares.map((s) => ({
+        recipient: s.recipient,
+        shareBps: s.shareBps,
+      })),
+    });
+    await this.db.$transaction(async (tx) => {
+      const existing = await tx.jobRecord.findUnique({ where: { id: jobId } });
+      if (existing?.status === "COMPLETED") return;
+      await tx.settlementEvent.updateMany({
+        where: { settlementRef: payload.settlementRef },
+        data: { status: "ANCHORED", stellarTxHash: result.txHash },
+      });
+      await tx.jobRecord.update({
+        where: { id: jobId },
+        data: { status: "COMPLETED", lastError: null, result: { ...result } },
+      });
+    });
+    this.logger.log(
+      JSON.stringify({
+        event: "stellar.settlement.anchored",
+        jobId,
+        txHash: result.txHash,
+      }),
+    );
+  }
+
   async onModuleDestroy() {
     if (this.reconcile) clearInterval(this.reconcile);
+    if (this.usageBatchTimer) clearInterval(this.usageBatchTimer);
+    if (this.settlementTimer) clearInterval(this.settlementTimer);
     await this.worker?.close();
     await this.stellarWorker?.close();
     await this.transcribeWorker?.close();

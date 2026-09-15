@@ -17,6 +17,7 @@ import { WorkspaceService } from "./workspace";
 import { ProductController } from "./controller";
 import { CaptureController } from "./capture";
 import { OrganizationsController } from "./organizations";
+import { registerTelemetry } from "./telemetry";
 @Module({
   controllers: [ProductController, CaptureController, OrganizationsController],
   providers: [
@@ -46,6 +47,7 @@ async function main() {
   );
   await app.register(cookie);
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
+  await registerTelemetry(app.getHttpAdapter().getInstance());
   const origin = process.env.WEB_ORIGIN || "http://localhost:3000";
   app.enableCors({ origin, credentials: true });
   app

@@ -27,7 +27,7 @@ Implemented: identity/session endpoints (including Freighter wallet sign-in), wo
 
 ## Expert credentials
 
-`POST /v1/experts/me/verification` submits verification evidence (`type`, `issuer`, optional `evidenceObjectKey`) as a `PENDING` `ExpertCredential`. `GET /v1/experts/me/credentials` lists the caller's own submissions. `POST /v1/experts/credentials/:id/review` approves/rejects evidence — **documented deviation**: the PRD does not define a platform-reviewer/moderator role or data model, and this environment has no real identity-verification service to call, so review access is gated by a `PLATFORM_REVIEWER_EMAILS` comma-separated env allowlist rather than a fabricated automatic approval. An approved credential sets `User.verificationStatus = "VERIFIED"`.
+`POST /v1/experts/me/verification` submits verification evidence (`type`, `issuer`, optional `evidenceObjectKey`) as a `PENDING` `ExpertCredential`. `GET /v1/experts/me/credentials` lists the caller's own submissions. `GET /v1/experts/credentials` lists pending submissions for platform reviewers. `POST /v1/experts/credentials/:id/review` approves/rejects evidence. Reviewers are users with `User.platformRole` of `ADMIN` or `REVIEWER`. `PLATFORM_ADMIN_EMAILS` / `PLATFORM_REVIEWER_EMAILS` only bootstrap those roles on first login. After that, `POST /v1/admin/platform-roles` (ADMIN only) assigns roles. An approved credential sets `User.verificationStatus = "VERIFIED"`.
 
 ## Checks
 
@@ -43,15 +43,15 @@ The smoke script creates synthetic accounts and data in the local Synapse databa
 
 ## Incomplete product requirements
 
-Do not deploy as production-complete. Still open:
-- Credential review uses an env-var reviewer allowlist, not a real platform-moderator role/model (see above).
-- Usage-receipt batching (`UsageReceiptRegistry.record`) exists in `stellar.ts`/the contract but nothing schedules/triggers a periodic batcher yet — no product flow calls it.
-- Settlement orchestration (payout routing against contributor shares) is not wired into any API flow; the `Settlement` contract's split arithmetic is implemented and tested in isolation only.
-- Provider data-retention controls, transcript redaction/deletion workflows, and secure-deletion-on-policy for unpublished sources are not implemented.
-- Full PRD endpoint-name aliases and a generated OpenAPI request-schema client are not built; the API is fully typed/validated/documented at `/v1/docs` but consumers hand-write request shapes rather than importing generated types.
-- Retrieval is source-grounded extractive matching, not semantic/vector search (PRD explicitly allows deferring pgvector until scale requires it — this is intentional, not a gap).
-- Audit coverage is broad (every state-changing action) but not exhaustively enumerated against every PRD data field.
-- Idempotency keys are enforced on every job and on financially/access-relevant mutations (messages, uploads, Stellar jobs); a few low-risk read-adjacent actions do not require one.
+Code for the PRD product loop is in place. What is still open is **human/ops**, not missing application features — see `/home/gamp/synapse/user_task.md`:
+
+- Real transcription provider keys, production object storage, funded Stellar signer, and (for Mainnet) a contract audit + redeploy.
+- Installing `tesseract-ocr` and (recommended) ClamAV on AI/API hosts.
+- A payment rail if you want `settle_split` proofs to correspond to actual bank/USDC payouts. The contract records the split; it does not move money.
+- Per-expert self-custodied Stellar signing (today the platform signer satisfies `require_auth`).
+- Semantic/vector search remains intentionally deferred (PRD allows this until scale requires it).
+
+Retrieval is source-grounded extractive matching. Audit coverage is broad on state-changing actions. Idempotency keys are enforced on jobs and financially/access-relevant mutations.
 
 MinIO uses its documented Quay registry because the Docker Hub image was unavailable. Reference: https://min.io/docs/minio/container/operations/install-deploy-manage/deploy-minio-single-node-multi-drive.html
 

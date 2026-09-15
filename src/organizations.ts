@@ -20,22 +20,16 @@ import {
   randomBase32Secret,
   totpUri,
   verifyTotp,
+  isPlatformReviewer,
   type Principal,
 } from "./core";
 
 /**
- * PRD §7 Identity: `Organization` / `OrganizationMembership`; PRD §21
- * Security: "MFA for organization admins"; PRD §7/§12: `ExpertCredential`
- * and `POST /experts/me/verification`.
- *
- * Deviation (documented per the master build file's execution rules): the
- * PRD does not define a platform-level reviewer/moderator role or data
- * model for credential review, and this sandbox has no real-world identity
- * verification service to call. The closest safe behavior implemented here
- * is: any authenticated user whose email is listed in the
- * `PLATFORM_REVIEWER_EMAILS` environment variable (comma-separated) may
- * review submitted evidence. This is documented in the README as an
- * explicit MVP limitation, not hidden behind a fake "verified" response.
+ * Organizations, MFA, expert credentials, and platform-moderator roles.
+ * Credential review is gated on the caller's persisted `User.platformRole`
+ * (ADMIN or REVIEWER). `PLATFORM_ADMIN_EMAILS` / `PLATFORM_REVIEWER_EMAILS`
+ * only bootstrap those roles on first authenticated request — they are not
+ * a substitute for the role column after that.
  */
 async function requireMembership(
   db: Database,
@@ -260,10 +254,48 @@ export class OrganizationsController {
     });
   }
 
+  @Get("experts/credentials")
+  @ApiOperation({
+    summary: "List pending credential submissions (platform reviewers only)",
+  })
+  async pendingCredentials(@Req() req: FastifyRequest) {
+    const user = await this.me(req);
+    if (!isPlatformReviewer(user))
+      throw new ForbiddenException(
+        "This account is not authorized to review credential evidence.",
+      );
+    return this.db.expertCredential.findMany({
+      where: { verificationStatus: "PENDING" },
+      orderBy: { createdAt: "desc" },
+    });
+  }
+
+  @Post("admin/platform-roles")
+  @ApiOperation({
+    summary: "Assign a platform role (ADMIN only)",
+  })
+  async assignPlatformRole(@Req() req: FastifyRequest, @Body() body: unknown) {
+    const actor = await this.me(req);
+    if (actor.platformRole !== "ADMIN")
+      throw new ForbiddenException("Only a platform admin may assign roles.");
+    const input = parse(
+      z.object({
+        email: z.email().transform((s) => s.toLowerCase()),
+        role: z.enum(["NONE", "REVIEWER", "ADMIN"]),
+      }),
+      body,
+    );
+    const target = await this.db.user.findUnique({ where: { email: input.email } });
+    if (!target) throw new NotFoundException("User not found.");
+    return this.db.user.update({
+      where: { id: target.id },
+      data: { platformRole: input.role },
+    });
+  }
+
   @Post("experts/credentials/:id/review")
   @ApiOperation({
-    summary:
-      "Review submitted evidence (platform-reviewer allowlist; see README)",
+    summary: "Review submitted evidence (platform ADMIN or REVIEWER)",
   })
   async reviewCredential(
     @Param("id") id: string,
@@ -271,11 +303,7 @@ export class OrganizationsController {
     @Body() body: unknown,
   ) {
     const user = await this.me(req);
-    const reviewers = (process.env.PLATFORM_REVIEWER_EMAILS || "")
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean);
-    if (!reviewers.includes(user.email.toLowerCase()))
+    if (!isPlatformReviewer(user))
       throw new ForbiddenException(
         "This account is not authorized to review credential evidence.",
       );

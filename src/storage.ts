@@ -12,6 +12,7 @@ import {
   HeadBucketCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { hash } from "./core";
 @Injectable()
 export class Storage {
@@ -72,5 +73,10 @@ export class Storage {
     );
     const bytes = Buffer.from(await result.Body!.transformToByteArray());
     return bytes;
+  }
+  async remove(key: string) {
+    await this.client.send(
+      new DeleteObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
   }
 }
