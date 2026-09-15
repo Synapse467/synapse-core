@@ -13,6 +13,8 @@ pnpm build
 pnpm start
 ```
 
+`pnpm dev` also works for iterative development (`tsc --watch` + `node --watch`, restarting on every compiled change) and is the recommended loop while editing — it always goes through the real TypeScript compiler rather than a fast transpiler like `tsx`/esbuild, because this codebase relies on NestJS's implicit type-based constructor injection (`design:paramtypes` decorator metadata), which `tsx`/esbuild silently fails to emit; a fast-transpiler-based `dev` script previously crashed on every single start for exactly that reason.
+
 Copy `.env.example` to `.env` and set the matching private AI service token. Local development credentials are not production credentials. The API listens on localhost:4000. Set `WEB_ORIGIN` to the exact web origin. Session cookies are HttpOnly, SameSite=Lax, Secure in production, stored server-side by token hash. Passwords use salted scrypt. Writes require the configured Origin.
 
 API docs: `/v1/docs`. Client projections are in the web repository. The initial SQL migration includes foreign keys, usage-cap checks, and immutable version/audit triggers in addition to Prisma-managed tables; preserve these in future migrations.
@@ -53,4 +55,4 @@ Do not deploy as production-complete. Still open:
 
 MinIO uses its documented Quay registry because the Docker Hub image was unavailable. Reference: https://min.io/docs/minio/container/operations/install-deploy-manage/deploy-minio-single-node-multi-drive.html
 
-MinIO uses its documented Quay registry because the Docker Hub image was unavailable. Reference: https://min.io/docs/minio/container/operations/install-deploy-manage/deploy-minio-single-node-multi-drive.html
+Verified 2026-09-15: the full `test/live-smoke.mjs` end-to-end suite passes against a real Postgres, Redis, and a live `synapse-ai` instance — registration, capsule capture, source ingestion through AI extraction and expert review, golden evaluation and immutable publication, cited query with unsupported-question abstention and license revocation, organization creation, MFA enrollment/enforcement, org-owned capsule visibility, and expert credential submission.
