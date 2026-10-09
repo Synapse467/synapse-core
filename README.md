@@ -1,58 +1,83 @@
-# Synapse API
+# synapse-core
 
-NestJS 12, Fastify, Prisma 7.10, PostgreSQL, Redis/BullMQ, and private S3-compatible storage. The authoritative PRD remains `../SYNAPSE_MASTER_BUILD.md`.
+The formats and rules of Synapse, as a small Go library with one dependency (the Stellar SDK) and no configuration.
 
-## Local setup
+If you want to **use** Synapse, start with [`synapse-cli`](https://github.com/Synapse467/synapse-cli). If you want to **build on** it, or implement it in another language, this is the repository that defines what a capsule, a license and a usage log are, and how each is checked.
 
-```sh
-pnpm install --frozen-lockfile
-docker compose -f docker-compose.dev.yml up -d
-pnpm db:generate
-pnpm db:migrate
-pnpm build
-pnpm start
+> **[`SPEC.md`](SPEC.md)** is the authoritative specification. The Go code here is its reference implementation, and the test vectors in [`testdata/vectors`](testdata/vectors) are how another implementation proves it agrees.
+
+## What is in it
+
+| Package | What it defines |
+|---|---|
+| [`canonical`](canonical) | Canonical JSON: the one byte sequence for a value, so a hash computed in any language matches. Integers only, sorted keys, minimal escaping. |
+| [`identity`](identity) | A Stellar Ed25519 key pair as an identity, created on first use and stored with `0600` permissions (owner-only on Linux and macOS; on Windows it relies on the permissions of your user profile folder). Domain-separated signing, so a signature made for one purpose is never valid for another. |
+| [`capsule`](capsule) | The capsule file: manifest, items (claims, procedures, heuristics, exceptions, cases), citations, evaluation record, policy, signatures. Drafts with a review workflow. Complete offline verification. |
+| [`license`](license) | Signed licenses, the pure `Check` function that decides a request and fails closed, signed revocations, signed requests, and a replay guard. |
+| [`usage`](usage) | A hash-chained, append-only usage log that stores question hashes only, and batch sealing for on-chain receipts. |
+| [`chain`](chain) | Optional Stellar client for the three contracts in [`synapse-contracts`](https://github.com/Synapse467/synapse-contracts). Defaults to the public Testnet deployment; funds new accounts with Friendbot; restores expired data automatically. |
+| [`home`](home) | Where Synapse keeps its files: your OS's config folder, or `SYNAPSE_HOME` if set. |
+
+## The model in one page
+
+- **A capsule is a file.** JSON, signed by its owner, versioned, with each version's hash chained to the one before.
+- **Everything hashed is canonicalised first**, so hashes and signatures are reproducible in any language.
+- **Identity is a Stellar address.** There are no accounts. A key is generated locally and never leaves the machine.
+- **A license is a file**, signed by the capsule's owner and checked offline by a pure function. Anything that cannot be positively confirmed is a denial.
+- **A usage log is a file** in which each entry commits to the one before it, so tampering shows. It stores a hash of each question, never the question.
+- **Stellar is optional evidence**: a public anchor for each capsule version, license grant and revocation, and sealed usage batch. Nothing depends on it.
+
+## Using it
+
+```go
+import (
+    "github.com/Synapse467/synapse-core/capsule"
+    "github.com/Synapse467/synapse-core/identity"
+    "github.com/Synapse467/synapse-core/license"
+)
+
+id, _, _ := identity.LoadOrCreate(identity.DefaultPath())   // made on first use
+
+c, _ := capsule.Load("tenancy.capsule.json")
+if report := capsule.Verify(c, nil); !report.OK {
+    log.Fatal(report.Issues)                                  // hash, signatures, structure, citations
+}
+
+lic, _ := license.Issue(license.Terms{
+    Capsule:  license.CapsuleRef{Owner: c.Manifest.Owner, Slug: c.Manifest.Slug},
+    Grantee:  "GBUYER…", Purposes: []string{"research"}, MaxQueries: 100,
+}, id)
+
+decision := license.Check(lic, c, nil, license.Request{Grantee: "GBUYER…", Purpose: "research", Now: time.Now()})
+// decision.Allowed, decision.Code ("ok", "quota_exhausted", "revoked", …), decision.Reason
 ```
 
-`pnpm dev` also works for iterative development (`tsc --watch` + `node --watch`, restarting on every compiled change) and is the recommended loop while editing — it always goes through the real TypeScript compiler rather than a fast transpiler like `tsx`/esbuild, because this codebase relies on NestJS's implicit type-based constructor injection (`design:paramtypes` decorator metadata), which `tsx`/esbuild silently fails to emit; a fast-transpiler-based `dev` script previously crashed on every single start for exactly that reason.
+Most programs want the higher-level [`synapse-engine`](https://github.com/Synapse467/synapse-engine) `synapse` package, which adds retrieval, logging and quotas on top of these.
 
-Copy `.env.example` to `.env` and set the matching private AI service token. Local development credentials are not production credentials. The API listens on localhost:4000. Set `WEB_ORIGIN` to the exact web origin. Session cookies are HttpOnly, SameSite=Lax, Secure in production, stored server-side by token hash. Passwords use salted scrypt. Writes require the configured Origin.
+## Guarantees the tests hold to
 
-API docs: `/v1/docs`. Client projections are in the web repository. The initial SQL migration includes foreign keys, usage-cap checks, and immutable version/audit triggers in addition to Prisma-managed tables; preserve these in future migrations.
+- Edits after signing are detected: tests cover altered capsules and licenses, forged citation quotes, and a usage log with entries changed, removed or reordered.
+- Canonical JSON reproduces every test vector, whose hashes were computed independently with `sha256sum`.
+- A license can only be issued by the capsule's owner, and a license, request or revocation cannot be reused under another signature domain.
+- Parsers reject unknown fields and enforce size limits before decoding.
+- The identity file is never overwritten, even when it is corrupt.
+- The Stellar client's full cycle (anchor, grant, record usage, revoke) is exercised against the live Testnet deployment by an opt-in test.
 
-Implemented: identity/session endpoints (including Freighter wallet sign-in), workspace projection/actions, ownership-scoped capsule editing (including organization-owned capsules), private source upload/finalization with SHA-256 validation, idempotent source jobs, prompt-injection/XSS security scanning on all source and knowledge text before it is persisted or sent to extraction, approval/rejection/correction, AI-generated and expert-authored evaluation cases, revision-specific publish gate, immutable snapshots/manifests, real Stellar Testnet anchoring for capsule publication and license grant/revocation (background workers, idempotent, with an audited DB trigger fix so anchor write-back can never silently fail), grants/revocation, public discovery, licensed conversations, provenance validation, serializable usage enforcement, ordered recoverable interview chunks with real AI transcription and automatic assembly into a reviewable source once every segment is transcribed, follow-up questions, organizations with membership and TOTP-based admin MFA enforcement, and expert-credential evidence submission/listing/review.
+## Build and test
 
-## Organizations & MFA
-
-`POST /v1/organizations` creates an organization; the creator becomes its first `ADMIN` member. Any member may create a capsule under the organization (`workspace/actions` `create-capsule` with `data.organizationId`), and any member can edit it. Admin-only actions — currently just inviting a member — additionally require a **currently valid TOTP code**: `POST /v1/organizations/:id/mfa/enroll` returns a secret + `otpauth://` URI for any standard authenticator app, and `POST /v1/organizations/:id/mfa/verify` activates enforcement. Until an admin enrolls and verifies MFA, admin-mutating actions are rejected outright — MFA is mandatory for org admins per the PRD, not optional. TOTP is implemented from scratch (RFC 6238, HMAC-SHA1) in `src/core.ts` with no new dependency.
-
-## Expert credentials
-
-`POST /v1/experts/me/verification` submits verification evidence (`type`, `issuer`, optional `evidenceObjectKey`) as a `PENDING` `ExpertCredential`. `GET /v1/experts/me/credentials` lists the caller's own submissions. `GET /v1/experts/credentials` lists pending submissions for platform reviewers. `POST /v1/experts/credentials/:id/review` approves/rejects evidence. Reviewers are users with `User.platformRole` of `ADMIN` or `REVIEWER`. `PLATFORM_ADMIN_EMAILS` / `PLATFORM_REVIEWER_EMAILS` only bootstrap those roles on first login. After that, `POST /v1/admin/platform-roles` (ADMIN only) assigns roles. An approved credential sets `User.verificationStatus = "VERIFIED"`.
-
-## Checks
-
-```sh
-pnpm typecheck
-pnpm lint
-pnpm test
-pnpm build
-node test/live-smoke.mjs
+```bash
+go test ./...                                       # offline tests only
+SYNAPSE_LIVE_TESTNET=1 go test ./chain -run Live    # also exercise the real Testnet contracts
 ```
 
-The smoke script creates synthetic accounts and data in the local Synapse database and retains them for inspection. It does not submit blockchain transactions or payments.
+## Stability
 
-## Incomplete product requirements
+The formats carry a version (`synapse.capsule/1` and so on). Changes within a version are additive in documentation only; a change to anything that is hashed or signed is a new version, and readers reject formats they do not know.
 
-Code for the PRD product loop is in place. What is still open is **human/ops**, not missing application features — see `/home/gamp/synapse/user_task.md`:
+## Security
 
-- Real transcription provider keys, production object storage, funded Stellar signer, and (for Mainnet) a contract audit + redeploy.
-- Installing `tesseract-ocr` and (recommended) ClamAV on AI/API hosts.
-- A payment rail if you want `settle_split` proofs to correspond to actual bank/USDC payouts. The contract records the split; it does not move money.
-- Per-expert self-custodied Stellar signing (today the platform signer satisfies `require_auth`).
-- Semantic/vector search remains intentionally deferred (PRD allows this until scale requires it).
+Please report vulnerabilities privately; see [SECURITY.md](SECURITY.md). Do not put keys, tokens or customer data in issues, tests or fixtures.
 
-Retrieval is source-grounded extractive matching. Audit coverage is broad on state-changing actions. Idempotency keys are enforced on jobs and financially/access-relevant mutations.
+## License
 
-MinIO uses its documented Quay registry because the Docker Hub image was unavailable. Reference: https://min.io/docs/minio/container/operations/install-deploy-manage/deploy-minio-single-node-multi-drive.html
-
-Verified 2026-09-15: the full `test/live-smoke.mjs` end-to-end suite passes against a real Postgres, Redis, and a live `synapse-ai` instance — registration, capsule capture, source ingestion through AI extraction and expert review, golden evaluation and immutable publication, cited query with unsupported-question abstention and license revocation, organization creation, MFA enrollment/enforcement, org-owned capsule visibility, and expert credential submission.
+MIT. See [LICENSE.md](LICENSE.md).

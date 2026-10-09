@@ -1,6 +1,16 @@
-node_modules/
-dist/
+# Secrets and local state never belong in the repository.
 .env
-coverage/
-src/generated/
-*.tsbuildinfo
+.env.*
+*.env
+identity.json
+*.seed
+.synapse/
+
+# Build output
+dist/
+target/
+*.exe
+*.wasm
+coverage.out
+.idea/
+.vscode/

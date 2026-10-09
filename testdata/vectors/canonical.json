@@ -1,0 +1,69 @@
+{
+  "description": "Synapse canonical JSON test vectors. An implementation is correct if it turns each input into exactly the canonical text, and sha256 of that text's UTF-8 bytes (lower-case hex) is the hash. The hashes were computed with the system sha256sum, not by the reference implementation.",
+  "valid": [
+    {
+      "name": "keys are sorted and whitespace removed",
+      "input": "{ \"b\" : 1, \"a\" : [ true , null , \"x\" ] }",
+      "canonical": "{\"a\":[true,null,\"x\"],\"b\":1}",
+      "sha256": "54a65415ad370228851a1da4b31b6fd42dc58b19a50d35cae759325f7388ce64"
+    },
+    {
+      "name": "only quote, backslash and control characters are escaped",
+      "input": "{\"s\":\"line\\nbreak \\\"q\\\" \\\\ \\u003c\\u0026\\u003e\"}",
+      "canonical": "{\"s\":\"line\\nbreak \\\"q\\\" \\\\ <&>\"}",
+      "sha256": "fff5a6f0445bf9cb08c3ec75a63d88d2fc1beed703faf37c05848ad3d4ec75d1"
+    },
+    {
+      "name": "non-ASCII text is written as UTF-8, not escaped",
+      "input": "{\"\\u00e9\":\"\\u65e5\\u672c\"}",
+      "canonical": "{\"é\":\"日本\"}",
+      "sha256": "7ef2ef803d8270933b33d03bb3f2f3a95457104cc8619a7743477cd94edd3724"
+    },
+    {
+      "name": "other control characters use lower-case \\u00xx",
+      "input": "{\"c\":\"\\u0001\\u001F\"}",
+      "canonical": "{\"c\":\"\\u0001\\u001f\"}",
+      "sha256": "a39b423fdc5b61aa5e723740ba20bf32a166888cc8060a3d36509b97aa3e8871"
+    },
+    {
+      "name": "empty containers",
+      "input": "{\"b\":[],\"a\":{}}",
+      "canonical": "{\"a\":{},\"b\":[]}",
+      "sha256": "aeeba1e56a144077f89e26c930dad7cf933e9383cfb8e33ddff618233b29be76"
+    },
+    {
+      "name": "integers, including zero, negatives and the largest safe integer",
+      "input": "{\"z\":0,\"n\":-7,\"big\":9007199254740991}",
+      "canonical": "{\"big\":9007199254740991,\"n\":-7,\"z\":0}",
+      "sha256": "7e1b355d34a47a31af1db684f0a0d2eddcbeeaded602f0966b69081c327a74f2"
+    },
+    {
+      "name": "keys sort by UTF-8 bytes, so upper case comes before lower case",
+      "input": "{\"B\":3,\"a\":2,\"A\":1}",
+      "canonical": "{\"A\":1,\"B\":3,\"a\":2}",
+      "sha256": "de3d9daf4d00ae67346ec24c5f061edad79e0a2e16eb1c36706861a42a4ac069"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "a fractional number",
+      "input": "{\"f\":1.5}"
+    },
+    {
+      "name": "a float written as an integer",
+      "input": "{\"f\":1.0}"
+    },
+    {
+      "name": "an exponent",
+      "input": "{\"f\":1e3}"
+    },
+    {
+      "name": "an integer above 2^53 - 1",
+      "input": "{\"f\":9007199254740992}"
+    },
+    {
+      "name": "an integer below -(2^53 - 1)",
+      "input": "{\"f\":-9007199254740992}"
+    }
+  ]
+}
