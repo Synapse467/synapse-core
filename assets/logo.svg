@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Synapse</title>
+  <desc id="desc">A capsule split by a seam, with a seal at the join.</desc>
+  <rect x="96" y="176" width="320" height="160" rx="80" fill="#14213d"/>
+  <path d="M256 176h80a80 80 0 0 1 0 160h-80Z" fill="#1769ff"/>
+  <circle cx="256" cy="256" r="30" fill="#ffffff"/>
+  <circle cx="256" cy="256" r="12" fill="#14213d"/>
+</svg>
